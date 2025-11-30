@@ -27,7 +27,7 @@ pyautogui.FAILSAFE = False
 # ====================================================================
 
 # Uygulama adı (AppData klasörü için kullanılacak)
-APP_NAME = "Python Otomasyon Botu"
+APP_NAME = "MilenSoftware"
 
 # JSON dosyasından yüklenecek global ayarlar ve aktif mod listesi
 GLOBAL_CONFIG = {}
@@ -38,7 +38,7 @@ ALARM_SOUND_PATH_FULL = ""
 # ⚡ BOT VE PERFORMANS AYARLARI
 TARGET_FPS = 2.0
 TARGET_FRAME_TIME = 1.0 / TARGET_FPS
-CURRENT_VERSION = "2.0.0"  # Final Sürüm Numarası
+CURRENT_VERSION = "2.0.1"  # Final Sürüm Numarası
 
 # 🔄 GÜNCELLEME AYARLARI
 GITHUB_REPO_OWNER = "merterbir"
@@ -62,6 +62,14 @@ MOD_TEMPLATES = {
         "upper_color": np.array([10, 255, 255]),
         "min_area": 100,
         "blocker_path": "zungblocker.png",    # default paket içi
+        "is_visible": True
+    },
+    "KIZIL": {
+        "title": "Kızıl Orman Güney Tarama",
+        "lower_color": np.array([0, 60, 70]),
+        "upper_color": np.array([10, 200, 200]),
+        "min_area": 1000,
+        "blocker_path": "kizilblocker.png",    # default paket içi
         "is_visible": True
     }
 }
@@ -151,7 +159,8 @@ def get_default_config():
         },
         "MOD_VISIBILITY": {
             "METEOR": True,
-            "ZUNG": True
+            "ZUNG": True,
+            "KIZIL": True
         },
         "ALERT_TEXTS": {
             "tic": "Tic (Kritik) Bulunursa",
@@ -539,6 +548,9 @@ class AutoClickerApp:
         self.mode_control_frames = {}
         self.color_region_use_vars = {}  # mod_id -> BooleanVar
 
+        # Debug penceresi referansı
+        self.debug_window = None
+
         self.setup_ui()
         master.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -598,19 +610,43 @@ class AutoClickerApp:
         self._save_persistent_settings()
         SettingsWindow(self.master, self)
 
+    def open_debug(self):
+        """Debug penceresini açar (varsa öne getirir)."""
+        if self.debug_window is not None:
+            try:
+                if self.debug_window.root.winfo_exists():
+                    self.debug_window.root.lift()
+                    return
+            except Exception:
+                self.debug_window = None
+
+        self.debug_window = DebugWindow(self.master)
+
     def setup_ui(self):
         for widget in self.master.winfo_children():
             widget.destroy()
 
         app_config = GLOBAL_CONFIG['APP_CONFIG']
 
+        # Ayarlar + Debug butonları
+        top_frame = tk.Frame(self.master)
+        top_frame.pack(pady=5, padx=15, fill=tk.X)
+
         tk.Button(
-            self.master,
+            top_frame,
             text=app_config['SETTINGS_BUTTON_TEXT'],
             command=self.open_settings,
             bg="light gray",
             width=12
-        ).pack(pady=5, padx=15, anchor='e')
+        ).pack(side=tk.RIGHT, padx=(5, 0))
+
+        tk.Button(
+            top_frame,
+            text="🐞 Debug",
+            command=self.open_debug,
+            bg="light gray",
+            width=10
+        ).pack(side=tk.RIGHT)
 
         tk.Label(
             self.master,
@@ -1475,6 +1511,205 @@ class SettingsWindow:
 
         self.settings_root.destroy()
         self.app.master.grab_release()
+
+
+# ====================================================================
+# BÖLÜM H: DEBUG PENCERESİ (HSV CANLI GÖRSEL)
+# ====================================================================
+
+class DebugWindow:
+    """
+    HSV aralıklarını canlı test etmek için debug penceresi.
+    - 3 sn içinde pencere seçimi (get_active_window_rect)
+    - HSV alt/üst + min area girme
+    - OpenCV penceresinde canlı olarak eşleşen yerleri kare içine alma
+    """
+    def __init__(self, master):
+        self.master = master
+        self.root = Toplevel(master)
+        self.root.title("Debug - HSV Canlı Görüntü")
+        self.root.geometry("360x330")
+        self.root.resizable(False, False)
+
+        self.debug_region_rect = None
+        self.debug_running = False
+        self.debug_thread = None
+
+        # HSV parametreleri
+        self.lower_h_var = tk.StringVar(value="0")
+        self.lower_s_var = tk.StringVar(value="150")
+        self.lower_v_var = tk.StringVar(value="150")
+
+        self.upper_h_var = tk.StringVar(value="10")
+        self.upper_s_var = tk.StringVar(value="255")
+        self.upper_v_var = tk.StringVar(value="255")
+
+        self.min_area_var = tk.StringVar(value="80")
+
+        self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _build_ui(self):
+        tk.Label(
+            self.root,
+            text="1) 3 sn içinde pencere seç\n2) HSV aralığı ve min area gir\n3) Debug Başlat",
+            justify="left"
+        ).pack(pady=5)
+
+        self.region_label = tk.Label(self.root, text="Bölge: Henüz seçilmedi", fg="red")
+        self.region_label.pack(pady=2)
+
+        tk.Button(
+            self.root,
+            text="Bölge Seç (3 sn)",
+            command=self.trigger_debug_region
+        ).pack(pady=5)
+
+        # HSV Alt / Üst
+        hsv_frame = tk.LabelFrame(self.root, text="HSV Aralığı", padx=5, pady=5)
+        hsv_frame.pack(pady=5, fill=tk.X, padx=10)
+
+        lower_row = tk.Frame(hsv_frame)
+        lower_row.pack(anchor='w', pady=2)
+        tk.Label(lower_row, text="Alt (H,S,V):").pack(side=tk.LEFT)
+        tk.Entry(lower_row, width=4, textvariable=self.lower_h_var).pack(side=tk.LEFT, padx=2)
+        tk.Entry(lower_row, width=4, textvariable=self.lower_s_var).pack(side=tk.LEFT, padx=2)
+        tk.Entry(lower_row, width=4, textvariable=self.lower_v_var).pack(side=tk.LEFT, padx=2)
+
+        upper_row = tk.Frame(hsv_frame)
+        upper_row.pack(anchor='w', pady=2)
+        tk.Label(upper_row, text="Üst (H,S,V): ").pack(side=tk.LEFT)
+        tk.Entry(upper_row, width=4, textvariable=self.upper_h_var).pack(side=tk.LEFT, padx=2)
+        tk.Entry(upper_row, width=4, textvariable=self.upper_s_var).pack(side=tk.LEFT, padx=2)
+        tk.Entry(upper_row, width=4, textvariable=self.upper_v_var).pack(side=tk.LEFT, padx=2)
+
+        area_frame = tk.Frame(self.root)
+        area_frame.pack(pady=5)
+        tk.Label(area_frame, text="Min Area:").pack(side=tk.LEFT)
+        tk.Entry(area_frame, width=6, textvariable=self.min_area_var).pack(side=tk.LEFT, padx=3)
+
+        btn_frame = tk.Frame(self.root)
+        btn_frame.pack(pady=10)
+        tk.Button(btn_frame, text="Debug Başlat", command=self.start_debug).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Debug Durdur", command=self.stop_debug).pack(side=tk.LEFT, padx=5)
+
+    # -------- Bölge Seçimi (3 sn sonra aktif pencere) --------
+
+    def trigger_debug_region(self):
+        self.region_label.config(text="Bölge: 3 sn içinde hedef pencereye geç...", fg="orange")
+        self.root.update()
+        self.root.after(3000, self._set_debug_region)
+
+    def _set_debug_region(self):
+        r = get_active_window_rect()
+        if r:
+            self.debug_region_rect = r
+            self.region_label.config(text=f"Bölge: {r}", fg="green")
+        else:
+            self.region_label.config(text="Bölge: Aktif pencere bulunamadı", fg="red")
+
+    # -------- HSV parametrelerini oku --------
+
+    def _get_params(self):
+        try:
+            lh = int(self.lower_h_var.get())
+            ls = int(self.lower_s_var.get())
+            lv = int(self.lower_v_var.get())
+            uh = int(self.upper_h_var.get())
+            us = int(self.upper_s_var.get())
+            uv = int(self.upper_v_var.get())
+            min_area = int(self.min_area_var.get())
+        except ValueError:
+            lh, ls, lv = 0, 0, 0
+            uh, us, uv = 179, 255, 255
+            min_area = 80
+
+        # HSV sınırlarını kliple
+        lh = max(0, min(179, lh))
+        uh = max(0, min(179, uh))
+        ls = max(0, min(255, ls))
+        us = max(0, min(255, us))
+        lv = max(0, min(255, lv))
+        uv = max(0, min(255, uv))
+        min_area = max(1, min_area)
+
+        lower = np.array([lh, ls, lv], dtype=np.uint8)
+        upper = np.array([uh, us, uv], dtype=np.uint8)
+        return lower, upper, min_area
+
+    # -------- Debug Loop --------
+
+    def start_debug(self):
+        if self.debug_running:
+            return
+        if self.debug_region_rect is None:
+            messagebox.showinfo("Bilgi", "Önce bir bölge seçmelisiniz.")
+            return
+
+        self.debug_running = True
+        self.debug_thread = Thread(target=self.debug_loop, daemon=True)
+        self.debug_thread.start()
+
+    def stop_debug(self):
+        self.debug_running = False
+        try:
+            cv2.destroyWindow("Debug Preview")
+        except Exception:
+            pass
+
+    def debug_loop(self):
+        sct = mss.mss()
+
+        while self.debug_running:
+            r = self.debug_region_rect
+            if not r:
+                time.sleep(0.1)
+                continue
+
+            X1, Y1, X2, Y2 = r
+            monitor = {"top": Y1, "left": X1, "width": X2 - X1, "height": Y2 - Y1}
+
+            try:
+                img = sct.grab(monitor)
+                frame = cv2.cvtColor(np.array(img), cv2.COLOR_BGRA2BGR)
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+                lower, upper, min_area = self._get_params()
+
+                mask = cv2.inRange(hsv, lower, upper)
+                k = np.ones((3, 3), np.uint8)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+
+                merge_kernel = np.ones((15, 15), np.uint8)
+                mask_merged = cv2.dilate(mask, merge_kernel, iterations=2)
+                mask_merged = cv2.erode(mask_merged, merge_kernel, iterations=1)
+
+                contours, _ = cv2.findContours(mask_merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                vis = frame.copy()
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+                    if area >= min_area:
+                        x, y, w, h = cv2.boundingRect(cnt)
+                        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
+
+                cv2.imshow("Debug Preview", vis)
+                cv2.waitKey(1)
+
+            except Exception:
+                pass
+
+            time.sleep(0.05)
+
+        # loop biterken pencereyi kapat
+        try:
+            cv2.destroyWindow("Debug Preview")
+        except Exception:
+            pass
+
+    def on_close(self):
+        self.stop_debug()
+        self.root.destroy()
 
 
 # ====================================================================
