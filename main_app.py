@@ -1,0 +1,1490 @@
+import mss
+import numpy as np
+import cv2
+import time
+import keyboard
+import pyautogui
+import win32gui
+import os
+import winsound
+import wave
+import audioop
+import io
+import sys
+import requests
+import tkinter as tk
+from threading import Thread
+from tkinter import messagebox, Toplevel, Scale, HORIZONTAL
+from tkinter import ttk
+import subprocess
+import json
+import uuid
+
+pyautogui.FAILSAFE = False
+
+# ====================================================================
+# BÖLÜM A: GLOBAL AYARLAR VE MOD KONFİGÜRASYONLARI
+# ====================================================================
+
+# Uygulama adı (AppData klasörü için kullanılacak)
+APP_NAME = "Python Otomasyon Botu"
+
+# JSON dosyasından yüklenecek global ayarlar ve aktif mod listesi
+GLOBAL_CONFIG = {}
+PERSISTENT_SETTINGS_PATH = "persistent_settings.json"  # Kalıcı ayarların kaydedileceği dosya adı
+ALARM_SOUND_PATH = "alert.wav"
+ALARM_SOUND_PATH_FULL = ""
+
+# ⚡ BOT VE PERFORMANS AYARLARI
+TARGET_FPS = 2.0
+TARGET_FRAME_TIME = 1.0 / TARGET_FPS
+CURRENT_VERSION = "2.0.0"  # Final Sürüm Numarası
+
+# 🔄 GÜNCELLEME AYARLARI
+GITHUB_REPO_OWNER = "merterbir"
+GITHUB_REPO_NAME = "AutoClicker-Updates"
+VERSION_CHECK_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/main/latest_version.json"
+NEW_EXE_FILENAME = "AutoClicker.exe"
+
+# 🎯 MOD ŞABLONLARI (Static tanımlar)
+MOD_TEMPLATES = {
+    "METEOR": {
+        "title": "Meteor Tarama",
+        "lower_color": np.array([112, 50, 20]),
+        "upper_color": np.array([160, 90, 140]),
+        "min_area": 80,
+        "blocker_path": "meteorBlocker.png",  # default paket içi
+        "is_visible": True
+    },
+    "ZUNG": {
+        "title": "Zung Tarama",
+        "lower_color": np.array([0, 150, 150]),
+        "upper_color": np.array([10, 255, 255]),
+        "min_area": 100,
+        "blocker_path": "zungblocker.png",    # default paket içi
+        "is_visible": True
+    }
+}
+
+# Mod Örnekleri (Instance'ları) Bu listede tutulacak. Her element bir dict olacak.
+ACTIVE_MOD_INSTANCES = []
+
+# Genel Alert Ayarları
+ALERT_IMAGE_PATHS = {
+    "tic": "tic.png",
+    "message": "message.png",
+    "control": "control.png"
+}
+ALERT_THRESHOLD = 0.80
+ALERT_CHECK_INTERVAL = 0.5
+ALERT_COOLDOWN = 3.0
+PAUSE_ON_ALERT_SECONDS = 5.0
+ALARM_VOLUME = 0.16  # Global değişken, yüklemede ayarlanacak
+
+# ====================================================================
+# BÖLÜM B: YARDIMCI FONKSİYONLAR VE KAYNAK YÖNETİMİ
+# ====================================================================
+
+def get_appdata_base_dir():
+    """
+    AppData\<APP_NAME> klasörünü döndürür.
+    Yoksa oluşturur. APPDATA yoksa exe dizinine düşer.
+    """
+    app_data_path = os.environ.get('APPDATA')
+    if app_data_path:
+        app_name = APP_NAME.replace(" ", "_")
+        base_dir = os.path.join(app_data_path, app_name)
+    else:
+        base_dir = os.path.abspath(os.path.dirname(sys.argv[0]))
+    os.makedirs(base_dir, exist_ok=True)
+    return base_dir
+
+
+def resource_path(relative_path):
+    """
+    Kalıcı ve yazılabilir dosyalar için AppData yolunu,
+    diğer PyInstaller kaynakları için MEIPASS yolunu döndürür.
+    """
+    # 1. Okunacak dosyalar (Görseller, Sesler) için PyInstaller kaynağını kullan.
+    if hasattr(sys, '_MEIPASS'):
+        if relative_path != PERSISTENT_SETTINGS_PATH:
+            return os.path.join(sys._MEIPASS, relative_path)
+
+    # 2. Yazma gerektiren dosyalar (persistent_settings.json) için kalıcı yolu bul.
+    if relative_path == PERSISTENT_SETTINGS_PATH:
+        try:
+            base_dir = get_appdata_base_dir()
+            return os.path.join(base_dir, relative_path)
+        except Exception:
+            # Hata oluşursa, fallback olarak exe'nin yanını kullan
+            pass
+
+    # 3. Diğer dosyalar veya hata durumları için EXE'nin bulunduğu dizini kullan.
+    base_path = os.path.abspath(os.path.dirname(sys.argv[0]))
+    return os.path.join(base_path, relative_path)
+
+
+def get_alert_user_path(filename: str) -> str:
+    """
+    Kullanıcının kendi çektiği screenshot'ları saklayacağımız yol.
+    (AppData\<APP_NAME>\tic.png, METEORBlocker.jpg vb.)
+    """
+    base_dir = get_appdata_base_dir()
+    return os.path.join(base_dir, filename)
+
+
+def get_default_config():
+    """Uygulamanın varsayılan metin ve ayar yapısını döndürür."""
+    return {
+        "APP_CONFIG": {
+            "APP_TITLE": "Python Otomasyon Botu",
+            "GLOBAL_AUTOCLICK_TEXT": "Global Oto Tıkla Aktif",
+            "MODES_FRAME_TITLE": "Tarama Modları",
+            "ALERT_FRAME_TITLE": "Alert ve Aksiyon Ayarları",
+            "STOP_ON_ALERT_TEXT": "Alert Bulunduğunda Bot Durdurulsun",
+            "SETTINGS_BUTTON_TEXT": "⚙️ Ayarlar",
+            "VERSION_CHECK_TEXT": "Güncelleme Kontrol Et",
+            "START_BUTTON_TEXT": "Başlat",
+            "STOP_BUTTON_TEXT": "DURDUR",
+            "REGION_BUTTON_TEXT": "Bölge Seç (3 sn)",
+            "STATUS_INITIAL_TEXT": "Kapalı. Modları başlatmak için yanındaki butonu kullanın."
+        },
+        "MOD_VISIBILITY": {
+            "METEOR": True,
+            "ZUNG": True
+        },
+        "ALERT_TEXTS": {
+            "tic": "Tic (Kritik) Bulunursa",
+            "message": "Message (Kritik) Bulunursa",
+            "control": "Control (Kritik) Bulunursa"
+        },
+        "SYSTEM_SETTINGS": {
+            "ALARM_VOLUME": 0.16,
+            "stop_on_alert_main": False,
+            "stop_on_tic": True,
+            "stop_on_message": True,
+            "stop_on_control": True
+        },
+        "SAVED_INSTANCES": []
+    }
+
+
+def _merge_config(default_data, loaded_data):
+    """
+    Yüklenen veriyi varsayılan veri ile birleştirir.
+    Eksik anahtarları tamamlar, varsayılanda olmayan fazla anahtarları siler.
+    """
+    merged = default_data.copy()
+
+    for key in merged:
+        if key in loaded_data and isinstance(merged[key], dict) and isinstance(loaded_data[key], dict):
+            merged[key] = _merge_config(merged[key], loaded_data[key])
+        elif key in loaded_data and type(merged[key]) == type(loaded_data[key]):
+            merged[key] = loaded_data[key]
+        elif key == "SAVED_INSTANCES" and isinstance(loaded_data.get(key), list):
+            merged[key] = loaded_data[key]
+
+    return merged
+
+
+def load_config():
+    """Kalıcı ayarları (persistent_settings.json) yükler. Yoksa varsayılanı kullanır."""
+    global GLOBAL_CONFIG, ALARM_VOLUME, ACTIVE_MOD_INSTANCES
+
+    default_config = get_default_config()
+    GLOBAL_CONFIG = default_config.copy()
+
+    config_path = resource_path(PERSISTENT_SETTINGS_PATH)
+
+    loaded_config = None
+
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                loaded_config = json.load(f)
+        except Exception:
+            loaded_config = None
+
+    if loaded_config:
+        GLOBAL_CONFIG = _merge_config(default_config, loaded_config)
+    else:
+        GLOBAL_CONFIG = default_config.copy()
+
+    ALARM_VOLUME = GLOBAL_CONFIG["SYSTEM_SETTINGS"]["ALARM_VOLUME"]
+    ACTIVE_MOD_INSTANCES = GLOBAL_CONFIG["SAVED_INSTANCES"]
+
+    if not os.path.exists(config_path) or not loaded_config:
+        save_config(GLOBAL_CONFIG)
+
+
+def save_config(new_config):
+    """Verilen sözlüğü kalıcı ayarlar dosyasına kaydeder."""
+    global GLOBAL_CONFIG
+    GLOBAL_CONFIG = new_config
+    config_path = resource_path(PERSISTENT_SETTINGS_PATH)
+
+    save_data = {
+        "SYSTEM_SETTINGS": GLOBAL_CONFIG["SYSTEM_SETTINGS"],
+        "SAVED_INSTANCES": GLOBAL_CONFIG["SAVED_INSTANCES"],
+        "MOD_VISIBILITY": GLOBAL_CONFIG["MOD_VISIBILITY"],
+    }
+
+    try:
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(save_data, f, indent=4, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+# Başlangıçta konfigürasyonu yükle
+load_config()
+
+ALARM_SOUND_PATH_FULL = resource_path(ALARM_SOUND_PATH)
+alarm_wave_data = None
+
+
+def load_alarm_sound():
+    global alarm_wave_data
+    if os.path.exists(ALARM_SOUND_PATH_FULL):
+        try:
+            with wave.open(ALARM_SOUND_PATH_FULL, "rb") as wf:
+                params = wf.getparams()
+                frames = wf.readframes(params.nframes)
+            alarm_wave_data = (frames, params.sampwidth, params.nchannels, params.framerate)
+        except:
+            alarm_wave_data = None
+
+
+load_alarm_sound()
+
+
+def play_alert_sound():
+    if alarm_wave_data is None:
+        return
+    frames, sampwidth, nchannels, framerate = alarm_wave_data
+    vol = max(0.0, min(1.5, ALARM_VOLUME))
+    scaled = audioop.mul(frames, sampwidth, vol)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(nchannels)
+        wf.setsampwidth(sampwidth)
+        wf.setframerate(framerate)
+        wf.writeframes(scaled)
+    winsound.PlaySound(buf.getvalue(), winsound.SND_MEMORY)
+
+
+def get_active_window_rect():
+    """Aktif pencerenin iç bölgesini döner."""
+    hwnd = win32gui.GetForegroundWindow()
+    if hwnd == 0:
+        return None
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    return (left + 8, top + 30, right - 8, bottom - 8)
+
+
+# ====================================================================
+# BÖLÜM C: GÖRSEL YAKALAMA VE ALAN SEÇİMİ SINIFLARI
+# ====================================================================
+
+class AreaSelector:
+    """
+    Alert görseli (tic.png, message.png, control.png veya mod blocker) için
+    tam ekran seçim yapan sınıf.
+    """
+    def __init__(self, master, callback, filename):
+        self.master = master
+        self.callback = callback
+        self.filename = filename
+        self.start_x = None
+        self.start_y = None
+        self.rect = None
+        self.snip_tool = None
+
+        self.screen_width = self.master.winfo_screenwidth()
+        self.screen_height = self.master.winfo_screenheight()
+
+        self.snip_tool = Toplevel(self.master)
+        self.snip_tool.title("Alan Seçimi")
+        self.snip_tool.geometry(f"{self.screen_width}x{self.screen_height}+0+0")
+
+        self.snip_tool.overrideredirect(True)
+        self.snip_tool.attributes("-alpha", 0.5)
+        self.snip_tool.attributes("-topmost", True)
+        self.snip_tool.focus_force()
+
+        self.canvas = tk.Canvas(self.snip_tool, cursor="tcross", bg='black', bd=0, highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.canvas.bind("<ButtonPress-1>", self.on_button_press)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_button_release)
+
+        self.snip_tool.bind("<Escape>", self.on_escape)
+
+    def on_escape(self, event=None):
+        """ESC ile screenshot alma iptali."""
+        try:
+            self.snip_tool.destroy()
+        except Exception:
+            pass
+        try:
+            self.master.deiconify()
+        except Exception:
+            pass
+        messagebox.showinfo("Bilgi", "Ekran görüntüsü alma iptal edildi (ESC).")
+
+    def on_button_press(self, event):
+        self.start_x = event.x
+        self.start_y = event.y
+        if self.rect:
+            self.canvas.delete(self.rect)
+
+    def on_mouse_drag(self, event):
+        self.canvas.delete(self.rect)
+        self.rect = self.canvas.create_rectangle(
+            self.start_x,
+            self.start_y,
+            event.x,
+            event.y,
+            outline='red',
+            width=2,
+            dash=(3, 2),
+            fill='black'
+        )
+
+    def on_button_release(self, event):
+        end_x, end_y = event.x, event.y
+
+        x1 = min(self.start_x, end_x)
+        y1 = min(self.start_y, end_y)
+        x2 = max(self.start_x, end_x)
+        y2 = max(self.start_y, end_y)
+
+        if x2 - x1 < 5 or y2 - y1 < 5:
+            try:
+                self.snip_tool.destroy()
+            except Exception:
+                pass
+            try:
+                self.master.deiconify()
+            except Exception:
+                pass
+            messagebox.showinfo("Bilgi", "Seçim iptal edildi. Çok küçük bir alan seçtiniz.")
+            return
+
+        root_x = self.snip_tool.winfo_rootx()
+        root_y = self.snip_tool.winfo_rooty()
+
+        screen_x1 = x1 + root_x
+        screen_y1 = y1 + root_y
+        screen_x2 = x2 + root_x
+        screen_y2 = y2 + root_y
+
+        try:
+            self.snip_tool.destroy()
+        except Exception:
+            pass
+
+        monitor = {
+            "top": int(screen_y1),
+            "left": int(screen_x1),
+            "width": int(screen_x2 - screen_x1),
+            "height": int(screen_y2 - screen_y1),
+        }
+
+        try:
+            sct = mss.mss()
+            sct_img = sct.grab(monitor)
+
+            img_np = np.array(sct_img)
+            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR)
+            img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+            # Alert ve blocker görselleri için aynı AppData yolunu kullanıyoruz
+            save_path = get_alert_user_path(self.filename)
+            cv2.imwrite(save_path, img_gray)
+        except Exception as e:
+            try:
+                self.master.deiconify()
+            except Exception:
+                pass
+            messagebox.showerror("Hata", f"Görsel kaydedilemedi: {e}")
+            return
+
+        self.callback(self.filename)
+
+
+class ColorRegionSelector:
+    """
+    Bir mod için pencere içi renk tarama alanını seçmek için kullanılan sınıf.
+    Sadece ilgili pencerenin alanını karartır.
+    """
+    def __init__(self, master, callback, region_rect):
+        self.master = master
+        self.callback = callback  # callback(global_x1, global_y1, global_x2, global_y2)
+        self.region_rect = region_rect
+        self.start_x = None
+        self.start_y = None
+        self.rect = None
+
+        X1, Y1, X2, Y2 = region_rect
+        w = X2 - X1
+        h = Y2 - Y1
+
+        self.snip_tool = Toplevel(self.master)
+        self.snip_tool.title("Renk Alanı Seçimi")
+        self.snip_tool.geometry(f"{w}x{h}+{X1}+{Y1}")
+        self.snip_tool.overrideredirect(True)
+        self.snip_tool.attributes("-alpha", 0.5)
+        self.snip_tool.attributes("-topmost", True)
+        self.snip_tool.focus_force()
+
+        self.canvas = tk.Canvas(self.snip_tool, cursor="tcross", bg='black', bd=0, highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.canvas.bind("<ButtonPress-1>", self.on_button_press)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_button_release)
+
+        self.snip_tool.bind("<Escape>", self.on_escape)
+
+    def on_escape(self, event=None):
+        try:
+            self.snip_tool.destroy()
+        except Exception:
+            pass
+        messagebox.showinfo("Bilgi", "Renk alanı seçimi iptal edildi (ESC).")
+
+    def on_button_press(self, event):
+        self.start_x = event.x
+        self.start_y = event.y
+        if self.rect:
+            self.canvas.delete(self.rect)
+
+    def on_mouse_drag(self, event):
+        self.canvas.delete(self.rect)
+        self.rect = self.canvas.create_rectangle(
+            self.start_x,
+            self.start_y,
+            event.x,
+            event.y,
+            outline='yellow',
+            width=2,
+            dash=(3, 2),
+            fill='black'
+        )
+
+    def on_button_release(self, event):
+        end_x, end_y = event.x, event.y
+
+        x1 = min(self.start_x, end_x)
+        y1 = min(self.start_y, end_y)
+        x2 = max(self.start_x, end_x)
+        y2 = max(self.start_y, end_y)
+
+        if x2 - x1 < 5 or y2 - y1 < 5:
+            try:
+                self.snip_tool.destroy()
+            except Exception:
+                pass
+            messagebox.showinfo("Bilgi", "Renk alanı seçimi iptal edildi. Çok küçük bir alan.")
+            return
+
+        root_x = self.snip_tool.winfo_rootx()
+        root_y = self.snip_tool.winfo_rooty()
+
+        screen_x1 = x1 + root_x
+        screen_y1 = y1 + root_y
+        screen_x2 = x2 + root_x
+        screen_y2 = y2 + root_y
+
+        try:
+            self.snip_tool.destroy()
+        except Exception:
+            pass
+
+        self.callback(screen_x1, screen_y1, screen_x2, screen_y2)
+
+
+# ====================================================================
+# BÖLÜM D: ANA UYGULAMA SINIFI (GUI ve BOT YÖNETİMİ)
+# ====================================================================
+
+class AutoClickerApp:
+    def __init__(self, master):
+        self.master = master
+        master.title(f"{GLOBAL_CONFIG['APP_CONFIG']['APP_TITLE']} v{CURRENT_VERSION} (Eş Zamanlı)")
+
+        # Sınıf Değişkenleri
+        self.alert_templates = self._load_alert_templates()
+        self.next_alert_check_time = 0.0
+        self.next_alert_allowed_time = 0.0
+        self.paused_until = 0.0
+
+        # Tkinter Değişkenleri
+        self.status_text = tk.StringVar(value=GLOBAL_CONFIG['APP_CONFIG']['STATUS_INITIAL_TEXT'])
+        self.auto_click_state = tk.BooleanVar(value=True)
+
+        # Alert Aksiyonları Değişkenleri
+        sys_settings = GLOBAL_CONFIG["SYSTEM_SETTINGS"]
+        self.stop_on_alert_main = tk.BooleanVar(value=sys_settings.get("stop_on_alert_main", False))
+        self.stop_on_tic = tk.BooleanVar(value=sys_settings.get("stop_on_tic", True))
+        self.stop_on_message = tk.BooleanVar(value=sys_settings.get("stop_on_message", True))
+        self.stop_on_control = tk.BooleanVar(value=sys_settings.get("stop_on_control", True))
+
+        # Mod Durum Değişkenleri
+        self.mode_status_vars = {}
+        self.mode_control_frames = {}
+        self.color_region_use_vars = {}  # mod_id -> BooleanVar
+
+        self.setup_ui()
+        master.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def on_closing(self):
+        for mod_instance in ACTIVE_MOD_INSTANCES:
+            mod_instance["is_running"] = False
+
+        self._save_persistent_settings()
+        self.master.destroy()
+        sys.exit(0)
+
+    def _save_persistent_settings(self):
+        global ALARM_VOLUME
+
+        saved_instances = []
+        for instance in ACTIVE_MOD_INSTANCES:
+            saved_instance = instance.copy()
+            saved_instance.pop("is_running", None)
+            saved_instance.pop("thread", None)
+            saved_instance.pop("start_stop_btn", None)
+            saved_instance.pop("color_btn", None)  # UI objesi
+            if isinstance(saved_instance.get("region_rect"), tuple):
+                saved_instance["region_rect"] = list(saved_instance["region_rect"])
+            if isinstance(saved_instance.get("color_region"), tuple):
+                saved_instance["color_region"] = list(saved_instance["color_region"])
+            saved_instances.append(saved_instance)
+
+        current_system_settings = GLOBAL_CONFIG.get("SYSTEM_SETTINGS", {})
+        current_system_settings["ALARM_VOLUME"] = ALARM_VOLUME
+        current_system_settings["stop_on_alert_main"] = self.stop_on_alert_main.get()
+        current_system_settings["stop_on_tic"] = self.stop_on_tic.get()
+        current_system_settings["stop_on_message"] = self.stop_on_message.get()
+        current_system_settings["stop_on_control"] = self.stop_on_control.get()
+
+        GLOBAL_CONFIG["SYSTEM_SETTINGS"] = current_system_settings
+        GLOBAL_CONFIG["SAVED_INSTANCES"] = saved_instances
+
+        save_config(GLOBAL_CONFIG)
+
+    def _load_alert_templates(self):
+        """Alert resimlerini yükler (Önce AppData override, sonra paket default)."""
+        templates = {}
+        for key, p in ALERT_IMAGE_PATHS.items():
+            user_path = get_alert_user_path(p)
+            if os.path.exists(user_path):
+                full_path = user_path
+            else:
+                full_path = resource_path(p)
+
+            if os.path.exists(full_path):
+                t = cv2.imread(full_path, cv2.IMREAD_GRAYSCALE)
+                if t is not None:
+                    templates[key] = t
+        return templates
+
+    def open_settings(self):
+        self._save_persistent_settings()
+        SettingsWindow(self.master, self)
+
+    def setup_ui(self):
+        for widget in self.master.winfo_children():
+            widget.destroy()
+
+        app_config = GLOBAL_CONFIG['APP_CONFIG']
+
+        tk.Button(
+            self.master,
+            text=app_config['SETTINGS_BUTTON_TEXT'],
+            command=self.open_settings,
+            bg="light gray",
+            width=12
+        ).pack(pady=5, padx=15, anchor='e')
+
+        tk.Label(
+            self.master,
+            textvariable=self.status_text,
+            fg="blue",
+            font=('Arial', 10, 'bold')
+        ).pack(pady=5, fill=tk.X)
+
+        main_frame = tk.Frame(self.master)
+        main_frame.pack(pady=10)
+
+        modes_container = tk.LabelFrame(main_frame, text=app_config['MODES_FRAME_TITLE'], padx=10, pady=10)
+        modes_container.pack(side=tk.LEFT, padx=15, fill=tk.Y)
+
+        add_frame = tk.Frame(modes_container)
+        add_frame.pack(pady=5)
+
+        for key, template in MOD_TEMPLATES.items():
+            if GLOBAL_CONFIG.get("MOD_VISIBILITY", {}).get(key, True):
+                add_func = lambda k=key, t=template['title']: self.add_new_mod_instance(k, t)
+                tk.Button(
+                    add_frame,
+                    text=f"+ Yeni {template['title']}",
+                    command=add_func,
+                    bg="yellow",
+                    fg="black"
+                ).pack(side=tk.LEFT, padx=5)
+
+        self.mod_instances_frame = tk.Frame(modes_container)
+        self.mod_instances_frame.pack(pady=10, fill=tk.X)
+
+        tk.Checkbutton(
+            modes_container,
+            text=app_config['GLOBAL_AUTOCLICK_TEXT'],
+            variable=self.auto_click_state
+        ).pack(pady=5, anchor='w')
+
+        self.mode_status_vars = {}
+        for instance in ACTIVE_MOD_INSTANCES:
+            if isinstance(instance.get("region_rect"), list):
+                instance["region_rect"] = tuple(instance["region_rect"])
+            if isinstance(instance.get("color_region"), list):
+                instance["color_region"] = tuple(instance["color_region"])
+            if "use_color_region" not in instance:
+                instance["use_color_region"] = False
+            instance["is_running"] = False
+            instance["thread"] = None
+            instance["start_stop_btn"] = None
+            instance["color_btn"] = None
+            self._create_mode_control_frame(self.mod_instances_frame, instance)
+
+        alert_frame = tk.LabelFrame(main_frame, text=app_config['ALERT_FRAME_TITLE'], padx=10, pady=10)
+        alert_frame.pack(side=tk.LEFT, padx=15, fill=tk.Y)
+
+        tk.Checkbutton(
+            alert_frame,
+            text=app_config['STOP_ON_ALERT_TEXT'],
+            variable=self.stop_on_alert_main,
+            command=self._update_alert_sub_options
+        ).pack(pady=5, anchor='w')
+
+        sub_alert_frame = tk.Frame(alert_frame, padx=10)
+        sub_alert_frame.pack(pady=5, anchor='w')
+
+        alert_texts = GLOBAL_CONFIG.get("ALERT_TEXTS", {})
+
+        self.tic_cb = tk.Checkbutton(
+            sub_alert_frame,
+            text=alert_texts.get("tic", "Tic (Kritik) Bulunursa"),
+            variable=self.stop_on_tic,
+            state=tk.DISABLED
+        )
+        self.tic_cb.pack(anchor='w')
+
+        self.message_cb = tk.Checkbutton(
+            sub_alert_frame,
+            text=alert_texts.get("message", "Message (Kritik) Bulunursa"),
+            variable=self.stop_on_message,
+            state=tk.DISABLED
+        )
+        self.message_cb.pack(anchor='w')
+
+        self.control_cb = tk.Checkbutton(
+            sub_alert_frame,
+            text=alert_texts.get("control", "Control (Kritik) Bulunursa"),
+            variable=self.stop_on_control,
+            state=tk.DISABLED
+        )
+        self.control_cb.pack(anchor='w')
+
+        tk.Button(
+            self.master,
+            text=f"{app_config['VERSION_CHECK_TEXT']} (v{CURRENT_VERSION})",
+            command=self.start_update_check_thread,
+            bg="light blue"
+        ).pack(pady=15, fill=tk.X, padx=15)
+
+        self._update_alert_sub_options()
+
+    def add_new_mod_instance(self, mod_key, mod_title):
+        template = MOD_TEMPLATES[mod_key]
+        instance_id = str(uuid.uuid4())
+        instance_count = len([m for m in ACTIVE_MOD_INSTANCES if m['mod_key'] == mod_key]) + 1
+
+        new_instance = {
+            "id": instance_id,
+            "mod_key": mod_key,
+            "title": f"{mod_title} #{instance_count}",
+            "lower_color": template["lower_color"].tolist(),
+            "upper_color": template["upper_color"].tolist(),
+            "region_rect": None,
+            "min_area": template["min_area"],
+            "blocker_path": template["blocker_path"],  # default path is still here
+            "color_region": None,
+            "use_color_region": False,
+            "is_running": False,
+            "thread": None,
+            "start_stop_btn": None,
+            "color_btn": None
+        }
+
+        ACTIVE_MOD_INSTANCES.append(new_instance)
+        self._create_mode_control_frame(self.mod_instances_frame, new_instance)
+        self.master.update_idletasks()
+
+    def _create_mode_control_frame(self, parent, mod_instance):
+        if mod_instance["id"] in self.mode_control_frames:
+            return
+
+        app_config = GLOBAL_CONFIG['APP_CONFIG']
+
+        frame = tk.LabelFrame(parent, text=mod_instance["title"], padx=5, pady=5)
+        frame.pack(pady=5, fill=tk.X)
+        self.mode_control_frames[mod_instance["id"]] = frame
+
+        initial_status = "Bölge Seçildi" if mod_instance["region_rect"] else "Bölge Seçilmeli"
+        status_var = tk.StringVar(value=initial_status)
+        self.mode_status_vars[mod_instance["id"]] = status_var
+        tk.Label(frame, textvariable=status_var, fg="dark green").pack(anchor='w')
+
+        btn_frame = tk.Frame(frame)
+        btn_frame.pack(pady=5)
+
+        start_stop_func = lambda m=mod_instance: self.toggle_bot(m)
+        start_stop_btn = tk.Button(
+            btn_frame,
+            text=app_config['START_BUTTON_TEXT'],
+            command=start_stop_func,
+            bg="green",
+            fg="white"
+        )
+        start_stop_btn.pack(side=tk.LEFT, padx=5)
+        mod_instance["start_stop_btn"] = start_stop_btn
+
+        region_func = lambda m=mod_instance: self.trigger_delayed_scan_region(m)
+        tk.Button(btn_frame, text=app_config['REGION_BUTTON_TEXT'], command=region_func).pack(side=tk.LEFT, padx=5)
+
+        # --- Renk alanı kısıtlama checkbox + buton ---
+        use_var = tk.BooleanVar(value=mod_instance.get("use_color_region", False))
+        self.color_region_use_vars[mod_instance["id"]] = use_var
+
+        color_region_func = lambda m=mod_instance: self.trigger_color_region_selection(m)
+        color_btn = tk.Button(btn_frame, text="Renk Alanı Seç", command=color_region_func)
+        mod_instance["color_btn"] = color_btn
+
+        def on_use_color_toggle(m=mod_instance, var=use_var, btn=color_btn):
+            m["use_color_region"] = var.get()
+            if var.get():
+                btn.pack(side=tk.LEFT, padx=5)
+            else:
+                btn.pack_forget()
+                m["color_region"] = None
+
+        chk = tk.Checkbutton(
+            frame,
+            text="Renk alanını kısıtla",
+            variable=use_var,
+            command=on_use_color_toggle
+        )
+        chk.pack(anchor='w')
+
+        # başlangıçta duruma göre butonu göster/gizle
+        if use_var.get():
+            color_btn.pack(side=tk.LEFT, padx=5)
+
+        remove_func = lambda m=mod_instance: self.remove_mod_instance(m)
+        tk.Button(btn_frame, text="X Kaldır", command=remove_func, bg="orange").pack(side=tk.LEFT, padx=15)
+
+    def remove_mod_instance(self, mod_instance):
+        if mod_instance.get("is_running"):
+            self.toggle_bot(mod_instance)
+
+        if messagebox.askyesno("Onay", f"'{mod_instance['title']}' modunu kaldırmak istediğinizden emin misiniz?"):
+            frame = self.mode_control_frames.pop(mod_instance["id"], None)
+            if frame:
+                frame.destroy()
+
+            if mod_instance in ACTIVE_MOD_INSTANCES:
+                ACTIVE_MOD_INSTANCES.remove(mod_instance)
+
+            self._update_global_status()
+            self._save_persistent_settings()
+
+    def _update_alert_sub_options(self):
+        state = tk.NORMAL if self.stop_on_alert_main.get() else tk.DISABLED
+        self.tic_cb.config(state=state)
+        self.message_cb.config(state=state)
+        self.control_cb.config(state=state)
+
+    def toggle_bot(self, mod_instance):
+        app_config = GLOBAL_CONFIG['APP_CONFIG']
+
+        if not mod_instance.get("is_running"):
+            if mod_instance["region_rect"] is None:
+                messagebox.showerror("Hata", f"{mod_instance['title']} için önce Bölge Seç yapın!")
+                return
+
+            mod_instance["is_running"] = True
+            mod_instance["start_stop_btn"].config(text=app_config['STOP_BUTTON_TEXT'], bg="red")
+            self.mode_status_vars[mod_instance["id"]].set("ÇALIŞIYOR")
+
+            t = Thread(target=self.bot_loop, args=(mod_instance,), daemon=True)
+            mod_instance["thread"] = t
+            t.start()
+
+            self._update_global_status()
+        else:
+            mod_instance["is_running"] = False
+            mod_instance["start_stop_btn"].config(text=app_config['START_BUTTON_TEXT'], bg="green")
+            self.mode_status_vars[mod_instance["id"]].set("DURDURULDU")
+            self._update_global_status()
+
+    def _update_global_status(self):
+        active_count = sum(1 for conf in ACTIVE_MOD_INSTANCES if conf.get("is_running"))
+        if active_count > 0:
+            self.status_text.set(
+                f"{active_count} mod aktif. Global Tıklama: {'AÇIK' if self.auto_click_state.get() else 'KAPALI'}"
+            )
+        else:
+            self.status_text.set(GLOBAL_CONFIG['APP_CONFIG']['STATUS_INITIAL_TEXT'])
+
+    def trigger_delayed_scan_region(self, mod_instance):
+        self.status_text.set("3 saniye içinde taramak istediğiniz pencereye tıklayın/geçin...")
+        self.master.update()
+        self.master.after(3000, lambda: self.update_scan_region(mod_instance))
+
+    def update_scan_region(self, mod_instance):
+        r = get_active_window_rect()
+
+        if r:
+            mod_instance["region_rect"] = r
+            X1, Y1, X2, Y2 = r
+
+            pyautogui.FAILSAFE = False
+            try:
+                pyautogui.moveTo(X1 + 10, Y1 + 10, duration=0.1)
+                pyautogui.dragTo(X2 - 10, Y2 - 10, duration=0.5, button='right')
+            except Exception:
+                pass
+            pyautogui.FAILSAFE = True
+
+            self.status_text.set(f"{mod_instance['title']} için tarama bölgesi ayarlandı.")
+            self.mode_status_vars[mod_instance["id"]].set("Bölge Seçildi")
+            self._save_persistent_settings()
+        else:
+            self.status_text.set("Hata: Aktif pencere bulunamadı. Lütfen tekrar deneyin.")
+
+    # ----------------- Renk Alanı Seçimi (mod bazlı) -----------------
+
+    def trigger_color_region_selection(self, mod_instance):
+        """Pencere içi renk tarama alanını seçtirir (yalnızca bu moda uygulanır)."""
+        if mod_instance.get("region_rect") is None:
+            messagebox.showerror("Hata", "Önce pencere bölgesini (Bölge Seç) belirleyin.")
+            return
+
+        if not mod_instance.get("use_color_region", False):
+            messagebox.showinfo("Bilgi", "Önce 'Renk alanını kısıtla' kutusunu işaretleyin.")
+            return
+
+        ColorRegionSelector(
+            self.master,
+            callback=lambda x1, y1, x2, y2, m=mod_instance: self._color_region_selected(m, x1, y1, x2, y2),
+            region_rect=mod_instance["region_rect"]
+        )
+
+    def _color_region_selected(self, mod_instance, sx1, sy1, sx2, sy2):
+        """Seçilen renk alanını sadece ilgili moda kaydeder."""
+        X1, Y1, X2, Y2 = mod_instance["region_rect"]
+
+        sx1 = max(X1, min(sx1, X2 - 1))
+        sx2 = max(X1 + 1, min(sx2, X2))
+        sy1 = max(Y1, min(sy1, Y2 - 1))
+        sy2 = max(Y1 + 1, min(sy2, Y2))
+
+        rel_left = sx1 - X1
+        rel_top = sy1 - Y1
+        width = sx2 - sx1
+        height = sy2 - sy1
+
+        color_region_tuple = (rel_left, rel_top, width, height)
+        mod_instance["color_region"] = color_region_tuple
+        self.status_text.set(f"{mod_instance['title']} için renk alanı seçildi.")
+        self._save_persistent_settings()
+
+    # ----------------------------------------------------------
+
+    def _check_alert_and_action(self, gray):
+        now = time.time()
+        if now < self.next_alert_allowed_time:
+            return False
+
+        alert_checks = {
+            "tic": self.stop_on_tic.get(),
+            "message": self.stop_on_message.get(),
+            "control": self.stop_on_control.get()
+        }
+
+        found_alert_for_stop = False
+
+        for key, template in self.alert_templates.items():
+            res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+            _, mv, _, _ = cv2.minMaxLoc(res)
+
+            if mv >= ALERT_THRESHOLD:
+                self.master.after(0, lambda k=key: self.status_text.set(
+                    f"!!! KRİTİK ALERT !!! {k.upper()}.png bulundu!"
+                ))
+                play_alert_sound()
+                self.next_alert_allowed_time = now + ALERT_COOLDOWN
+
+                if self.stop_on_alert_main.get() and alert_checks.get(key, False):
+                    self.master.after(0, self.stop_all_bots)
+                    found_alert_for_stop = True
+                    break
+
+                self.paused_until = now + PAUSE_ON_ALERT_SECONDS
+                break
+
+        return found_alert_for_stop
+
+    def stop_all_bots(self):
+        app_config = GLOBAL_CONFIG['APP_CONFIG']
+        for mod_instance in ACTIVE_MOD_INSTANCES:
+            if mod_instance.get("is_running"):
+                mod_instance["is_running"] = False
+
+                self.master.after(
+                    0,
+                    lambda m=mod_instance: m["start_stop_btn"].config(
+                        text=app_config['START_BUTTON_TEXT'],
+                        bg="green"
+                    )
+                )
+                self.master.after(
+                    0,
+                    lambda m=mod_instance: self.mode_status_vars[m["id"]].set("KRİTİK HATA")
+                )
+
+        self.master.after(0, lambda: self.status_text.set("KRİTİK ALERT: Tüm botlar kapatıldı."))
+        self.master.after(0, self._update_global_status)
+
+    def check_blocker(self, sct, mod_instance, monitor_region):
+        """
+        Tarama bölgesinde blocker görseli var mı diye kontrol eder.
+        Önce AppData\<APP_NAME>\<MODKEY>Blocker.jpg denenir.
+        Yoksa default paket içi blocker_path kullanılır.
+        """
+        mod_key = mod_instance.get("mod_key")
+        if not mod_key:
+            return False
+
+        # 1) Kullanıcıya özel blocker (AppData)
+        user_blocker_name = f"{mod_key.lower()}Blocker.jpg"
+        user_blocker_path = get_alert_user_path(user_blocker_name)
+        full_blocker_path = None
+
+        if os.path.exists(user_blocker_path):
+            full_blocker_path = user_blocker_path
+        else:
+            # 2) Default paket içi blocker_path
+            blocker_path = mod_instance.get("blocker_path")
+            if not blocker_path:
+                return False
+            full_blocker_path = resource_path(blocker_path)
+
+        blocker_template = cv2.imread(full_blocker_path, cv2.IMREAD_GRAYSCALE)
+        if blocker_template is None:
+            return False
+
+        img = sct.grab(monitor_region)
+        f = cv2.cvtColor(np.array(img), cv2.COLOR_BGRA2BGR)
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+
+        res = cv2.matchTemplate(g, blocker_template, cv2.TM_CCOEFF_NORMED)
+        _, mv, _, _ = cv2.minMaxLoc(res)
+
+        return mv >= mod_instance.get("blocker_threshold", 0.70)
+
+    def bot_loop(self, mod_instance):
+        sct = mss.mss()
+
+        X1, Y1, X2, Y2 = mod_instance["region_rect"]
+        monitor_region = {"top": Y1, "left": X1, "width": X2 - X1, "height": Y2 - Y1}
+
+        LOWER_COLOR = np.array(mod_instance["lower_color"])
+        UPPER_COLOR = np.array(mod_instance["upper_color"])
+        MIN_AREA = mod_instance["min_area"]
+
+        action_due = True
+        next_blocker_check_time = 0.0
+
+        while mod_instance.get("is_running"):
+            loop_start_time = time.time()
+
+            try:
+                img = sct.grab(monitor_region)
+                frame = cv2.cvtColor(np.array(img), cv2.COLOR_BGRA2BGR)
+                hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                # ALERT kontrolü tüm pencere üzerinde
+                if time.time() >= self.next_alert_check_time:
+                    if self._check_alert_and_action(gray_full):
+                        break
+                    self.next_alert_check_time = time.time() + ALERT_CHECK_INTERVAL
+
+                now = time.time()
+                paused = now < self.paused_until
+
+                if paused:
+                    time.sleep(TARGET_FRAME_TIME)
+                    continue
+
+                # ----- Renk tarama için kullanılacak alan -----
+                h_full, w_full = frame.shape[:2]
+
+                use_color = mod_instance.get("use_color_region", False)
+                color_region = mod_instance.get("color_region") if use_color else None
+
+                if color_region:
+                    rel_left, rel_top, c_w, c_h = color_region
+
+                    rel_left = int(max(0, min(rel_left, w_full - 1)))
+                    rel_top = int(max(0, min(rel_top, h_full - 1)))
+                    c_w = int(max(1, min(c_w, w_full - rel_left)))
+                    c_h = int(max(1, min(c_h, h_full - rel_top)))
+
+                    hsv = hsv_full[rel_top:rel_top + c_h, rel_left:rel_left + c_w]
+                    detect_offset_x = rel_left
+                    detect_offset_y = rel_top
+                    region_cx_local = c_w / 2
+                    region_cy_local = c_h / 2
+                else:
+                    hsv = hsv_full
+                    detect_offset_x = 0
+                    detect_offset_y = 0
+                    region_cx_local = w_full / 2
+                    region_cy_local = h_full / 2
+
+                # ----- Renk maskesi ve kontur tespiti -----
+                mask = cv2.inRange(hsv, LOWER_COLOR, UPPER_COLOR)
+                k = np.ones((3, 3), np.uint8)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+
+                merge_kernel = np.ones((15, 15), np.uint8)
+                mask_merged = cv2.dilate(mask, merge_kernel, iterations=2)
+                mask_merged = cv2.erode(mask_merged, merge_kernel, iterations=1)
+                contours, _ = cv2.findContours(mask_merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                candidate = []
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+                    if area >= MIN_AREA:
+                        x, y, w, h = cv2.boundingRect(cnt)
+                        candidate.append((x, y, w, h))
+
+                best = None
+                if candidate:
+                    best_dist = float('inf')
+                    for (x, y, w, h) in candidate:
+                        cx = x + w / 2
+                        cy = y + h / 2
+                        d = (cx - region_cx_local) ** 2 + (cy - region_cy_local) ** 2
+                        if d < best_dist:
+                            best_dist = d
+                            best = (x, y, w, h, cx, cy)
+
+                # BLOCKER kontrolü tüm pencere üzerinde
+                if mod_instance.get("blocker_path") and not action_due and now >= next_blocker_check_time:
+                    blocker_present = self.check_blocker(sct, mod_instance, monitor_region)
+                    if not blocker_present:
+                        action_due = True
+                    else:
+                        next_blocker_check_time = now + 3.0
+
+                if best and action_due:
+                    x, y, w, h, cx_local, cy_local = best
+                    cx_global = detect_offset_x + cx_local
+                    cy_global = detect_offset_y + cy_local
+
+                    sx = int(X1 + cx_global)
+                    sy = int(Y1 + cy_global)
+
+                    pyautogui.moveTo(sx, sy)
+
+                    if self.auto_click_state.get():
+                        pyautogui.click()
+                        self.master.after(
+                            0,
+                            lambda m=mod_instance: self.status_text.set(f"Tıklandı: {m['title']}")
+                        )
+                    else:
+                        self.master.after(
+                            0,
+                            lambda m=mod_instance: self.status_text.set(f"Taşındı: {m['title']}")
+                        )
+
+                    if mod_instance.get("blocker_path"):
+                        action_due = False
+                        next_blocker_check_time = now + 3.0
+                    else:
+                        action_due = True
+
+            except Exception:
+                pass
+
+            elapsed_time = time.time() - loop_start_time
+            sleep_time = TARGET_FRAME_TIME - elapsed_time
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        if not self.master.winfo_exists():
+            return
+
+        status = "HATA" if mod_instance.get("is_running") else "DURDURULDU"
+
+        if mod_instance["id"] in self.mode_status_vars:
+            self.master.after(0, lambda: self.mode_status_vars[mod_instance["id"]].set(status))
+
+        self.master.after(0, self._update_global_status)
+
+    # ====================================================================
+    # BÖLÜM E: GÜNCELLEME FONKSİYONLARI
+    # ====================================================================
+
+    def start_update_check_thread(self):
+        self.status_text.set("Güncellemeler kontrol ediliyor...")
+        self.master.update_idletasks()
+        Thread(target=self._check_for_updates, daemon=True).start()
+
+    def _check_for_updates(self):
+        try:
+            response = requests.get(VERSION_CHECK_URL, timeout=5)
+            response.raise_for_status()
+            latest_info = response.json()
+
+            latest_version = latest_info["latest_version"]
+            download_url = latest_info["download_url"]
+
+            if latest_version > CURRENT_VERSION:
+                self.master.after(0, lambda: self._prompt_and_download(latest_version, download_url))
+            else:
+                self.status_text.set(f"Zaten en son sürüme sahipsiniz. (v{CURRENT_VERSION})")
+
+        except requests.RequestException:
+            self.status_text.set("Güncelleme kontrolü başarısız oldu. İnternet veya URL'yi kontrol edin.")
+
+    def _prompt_and_download(self, version, url):
+        if messagebox.askyesno(
+            "Güncelleme Mevcut",
+            f"Yeni sürüm v{version} mevcut. İndirip uygulamak ister misiniz? (Uygulama yeniden başlatılacaktır)"
+        ):
+            self.status_text.set("Güncelleme İndiriliyor...")
+            Thread(target=self._download_and_install_update, args=(url, version), daemon=True).start()
+
+    def _download_and_install_update(self, url, version):
+        try:
+            # EXE'nin bulunduğu klasör
+            base_dir = os.path.dirname(os.path.abspath(sys.executable))
+            zip_name = f"update_{version}.zip"
+            temp_zip_path = os.path.join(base_dir, zip_name)
+            batch_path = os.path.join(base_dir, "update_installer.bat")
+
+            # ZIP'i indir
+            r = requests.get(url, stream=True, timeout=15)
+            r.raise_for_status()
+
+            with open(temp_zip_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+            # ZIP imzası kontrol
+            with open(temp_zip_path, "rb") as check:
+                sig = check.read(2)
+
+            if sig != b"PK":
+                messagebox.showerror(
+                    "Güncelleme Hatası",
+                    "İndirilen dosya ZIP formatında değil (ilk byte'lar 'PK' değil).\n"
+                    "Muhtemelen GitHub RAW linki HTML hata sayfası döndürdü."
+                )
+                self.status_text.set("ZIP hatalı, güncelleme iptal edildi.")
+                try:
+                    os.remove(temp_zip_path)
+                except Exception:
+                    pass
+                return
+
+            self.status_text.set("İndirme tamamlandı. Kurulum hazırlanıyor...")
+            self.master.update_idletasks()
+
+            # Batch içeriği (hata olsa da konsol açık kalsın)
+            script_content = f"""@echo off
+echo Kurulum Baslatiliyor...
+cd /d "%~dp0"
+echo Calisma klasoru: %CD%
+
+set ZIP_NAME={zip_name}
+set NEW_EXE={NEW_EXE_FILENAME}
+
+rem Rastgele gecici klasor olustur
+set TEMP_DIR=update_%RANDOM%_%RANDOM%
+mkdir "%TEMP_DIR%"
+
+echo Arsiv cikartiliyor: %ZIP_NAME% -> %TEMP_DIR%
+powershell -NoLogo -NoProfile -Command "try {{ Expand-Archive -LiteralPath '%ZIP_NAME%' -DestinationPath '%TEMP_DIR%' -Force; exit 0 }} catch {{ Write-Host 'PowerShell Hata:' $_.Exception.Message; exit 1 }}"
+
+echo Expand-Archive cikis kodu: %ERRORLEVEL%
+if %ERRORLEVEL% NEQ 0 (
+    echo HATA: Expand-Archive sirasinda hata olustu.
+    goto CLEANUP
+)
+
+if not exist "%TEMP_DIR%\\%NEW_EXE%" (
+    echo HATA: %TEMP_DIR% klasorunde %NEW_EXE% bulunamadi.
+    goto CLEANUP
+)
+
+echo Eski exe uzerine yazmak icin bekleniyor...
+timeout /t 2 /nobreak >nul
+
+echo Yeni exe tasiniyor...
+move /Y "%TEMP_DIR%\\%NEW_EXE%" "%NEW_EXE%"
+
+if %ERRORLEVEL% NEQ 0 (
+    echo HATA: %NEW_EXE% uzerine yazilamadi (dosya kilitli olabilir).
+    goto CLEANUP
+)
+
+:CLEANUP
+echo Gecici klasor/dosya temizleniyor...
+if exist "%TEMP_DIR%\\" rmdir /s /q "%TEMP_DIR%"
+if exist "%TEMP_DIR%" del /f /q "%TEMP_DIR%"
+
+echo Zip dosyasi siliniyor...
+if exist "%ZIP_NAME%" del /f /q "%ZIP_NAME%"
+
+echo Yeni exe baslatiliyor (varsa)...
+if exist "%NEW_EXE%" start "" "%NEW_EXE%"
+
+echo.
+echo --- GUNCELLEYICI BITTI ---
+echo Konsolu kapatmak icin bir tusa basin...
+pause >nul
+"""
+
+            with open(batch_path, "w", encoding="utf-8") as f:
+                f.write(script_content)
+
+            subprocess.Popen(
+                [batch_path],
+                cwd=base_dir,
+                creationflags=subprocess.CREATE_NEW_CONSOLE
+            )
+
+            self.master.quit()
+
+        except Exception as e:
+            self.status_text.set("Güncelleme/Kurulum sırasında kritik hata oluştu.")
+            messagebox.showerror("Hata", f"Güncelleme başarısız oldu: {e}")
+            self.status_text.set(f"Güncelleme Başarısız. (v{CURRENT_VERSION})")
+
+
+# ====================================================================
+# BÖLÜM F: AYARLAR PENCERESİ SINIFI (SettingsWindow)
+# ====================================================================
+
+class SettingsWindow:
+    def __init__(self, master, app_instance):
+        global ALARM_VOLUME
+        self.app = app_instance
+        self.settings_root = Toplevel(master)
+        self.settings_root.title("Gelişmiş Ayarlar")
+        self.settings_root.geometry("480x520")
+        self.settings_root.transient(master)
+        self.settings_root.grab_set()
+
+        self.master = master
+        self.current_config = GLOBAL_CONFIG.copy()
+
+        self.local_volume_value = tk.DoubleVar(value=ALARM_VOLUME)
+
+        tk.Button(
+            self.settings_root,
+            text="Ayarları Kaydet ve Kapat",
+            command=self._save_and_close,
+            bg="red",
+            fg="white",
+            font=('Arial', 10, 'bold'),
+            width=25
+        ).pack(pady=10)
+
+        self.notebook = ttk.Notebook(self.settings_root)
+        self.notebook.pack(pady=5, padx=10, fill='both', expand=True)
+
+        self._create_general_settings_tab()
+        self._create_image_settings_tab()
+
+    def _create_general_settings_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text='Genel Ayarlar')
+
+        volume_frame = tk.LabelFrame(tab, text="Alarm Ses Seviyesi (0-100)", padx=10, pady=5)
+        volume_frame.pack(pady=10, fill=tk.X, padx=10)
+
+        self.volume_scale = Scale(
+            volume_frame,
+            from_=0,
+            to=100,
+            orient=HORIZONTAL,
+            length=350,
+            command=self._update_volume_setting
+        )
+        self.volume_scale.set(int(self.local_volume_value.get() * 100))
+        self.volume_scale.pack()
+
+        visibility_frame = tk.LabelFrame(tab, text="Ana Sayfada Gösterilecek Yeni Mod Butonları", padx=10, pady=5)
+        visibility_frame.pack(pady=10, fill=tk.X, padx=10)
+
+        self.visibility_vars = {}
+        for mod_key, conf in MOD_TEMPLATES.items():
+            is_visible = self.current_config.get("MOD_VISIBILITY", {}).get(mod_key, True)
+            var = tk.BooleanVar(value=is_visible)
+            self.visibility_vars[mod_key] = var
+            tk.Checkbutton(visibility_frame, text=conf["title"], variable=var).pack(anchor='w')
+
+    def _create_image_settings_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text='Görsel Ayarları')
+
+        tk.Label(
+            tab,
+            text=(
+                "Alert görsellerini ve mod blocker görsellerini buradan yeniden yakalayabilirsiniz.\n"
+                "(Dosyalar AppData içinde saklanır, güncellemelerden etkilenmez.)"
+            ),
+            wraplength=430
+        ).pack(pady=10)
+
+        # Alert görselleri
+        alert_frame = tk.LabelFrame(tab, text="Alert Görselleri", padx=10, pady=5)
+        alert_frame.pack(pady=5, fill=tk.X, padx=10)
+
+        alert_texts = GLOBAL_CONFIG.get("ALERT_TEXTS", {})
+
+        self._create_image_setting_button(alert_frame, "tic.png", alert_texts.get("tic", "Tic Görseli"))
+        self._create_image_setting_button(alert_frame, "message.png", alert_texts.get("message", "Message Görseli"))
+        self._create_image_setting_button(alert_frame, "control.png", alert_texts.get("control", "Control Görseli"))
+
+        # Mod Blocker görselleri
+        blocker_frame = tk.LabelFrame(tab, text="Mod Blocker Görselleri", padx=10, pady=5)
+        blocker_frame.pack(pady=10, fill=tk.X, padx=10)
+
+        for mod_key, conf in MOD_TEMPLATES.items():
+            self._create_blocker_setting_button(blocker_frame, mod_key, conf["title"])
+
+    def _create_blocker_setting_button(self, parent_frame, mod_key, title_text):
+        """
+        Her mod için ayrı blocker çekme butonu:
+        AppData\<APP_NAME>\<mod_key>Blocker.jpg
+        """
+        filename = f"{mod_key.lower()}Blocker.jpg"
+        btn_func = lambda f=filename: self.start_blocker_area_selection(f)
+        tk.Button(
+            parent_frame,
+            text=f"📷 {title_text} Blocker",
+            command=btn_func
+        ).pack(pady=3, fill=tk.X)
+
+    def _update_volume_setting(self, value):
+        volume = float(value) / 100.0
+        self.local_volume_value.set(volume)
+
+    def _create_image_setting_button(self, parent_frame, filename, text):
+        btn_func = lambda f=filename: self.start_area_selection(f)
+        tk.Button(parent_frame, text=f"📷 {text}", command=btn_func).pack(pady=3, fill=tk.X)
+
+    def start_area_selection(self, filename):
+        """
+        Alert görselleri için alan seçimi.
+        """
+        try:
+            self.settings_root.grab_release()
+        except Exception:
+            pass
+        self.settings_root.withdraw()
+        AreaSelector(self.settings_root, self._alert_capture_completed, filename)
+
+    def start_blocker_area_selection(self, filename):
+        """
+        Mod Blocker görselleri için alan seçimi.
+        filename: MODKEYBlocker.jpg
+        """
+        try:
+            self.settings_root.grab_release()
+        except Exception:
+            pass
+        self.settings_root.withdraw()
+        AreaSelector(self.settings_root, self._blocker_capture_completed, filename)
+
+    def _alert_capture_completed(self, filename):
+        try:
+            self.settings_root.deiconify()
+            self.settings_root.grab_set()
+        except Exception:
+            pass
+
+        self.app.alert_templates = self.app._load_alert_templates()
+        messagebox.showinfo("Başarılı", f"'{filename}' alert görseli başarıyla güncellendi ve kaydedildi.")
+
+    def _blocker_capture_completed(self, filename):
+        """
+        Blocker görseli tamamlandığında çağrılır.
+        filename: örn. METEORBlocker.jpg
+        """
+        try:
+            self.settings_root.deiconify()
+            self.settings_root.grab_set()
+        except Exception:
+            pass
+
+        # Sadece bilgilendirme yeterli; check_blocker otomatik olarak AppData'daki dosyayı kullanacak.
+        messagebox.showinfo("Başarılı", f"'{filename}' blocker görseli başarıyla güncellendi ve kaydedildi.")
+
+    def _save_and_close(self):
+        global ALARM_VOLUME
+
+        for mod_key, var in self.visibility_vars.items():
+            self.current_config["MOD_VISIBILITY"][mod_key] = var.get()
+
+        new_volume = self.local_volume_value.get()
+        self.current_config["SYSTEM_SETTINGS"]["ALARM_VOLUME"] = new_volume
+        ALARM_VOLUME = new_volume
+
+        if save_config(self.current_config):
+            messagebox.showinfo("Başarılı", "Ayarlar kaydedildi. Arayüz yeniden çiziliyor.")
+        else:
+            messagebox.showerror("Hata", "Ayarlar kaydedilemedi! persistent_settings.json yazılabilir mi?")
+
+        self.app.setup_ui()
+
+        self.settings_root.destroy()
+        self.app.master.grab_release()
+
+
+# ====================================================================
+# BÖLÜM G: UYGULAMA BAŞLANGICI
+# ====================================================================
+
+if __name__ == "__main__":
+    try:
+        root = tk.Tk()
+        app = AutoClickerApp(root)
+        root.mainloop()
+    except Exception as e:
+        print(f"Uygulama başlatma hatası: {e}")
