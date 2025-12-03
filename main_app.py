@@ -23,6 +23,11 @@ import subprocess
 import json
 import uuid
 from pynput.keyboard import Key, Controller as PynputKeyboardController, KeyCode
+import re
+import threading
+
+from PIL import Image, ImageTk
+import easyocr
 
 pyautogui.FAILSAFE = False
 
@@ -41,7 +46,34 @@ CLICK_DELAY_MS = 0
 BLOCKER_THRESHOLD = 0.70
 BLOCKER_RETRY_SECONDS = 3.0
 
-CURRENT_VERSION = "2.0.1"
+HARDCODED_OCR_PROFILES = {
+    (800, 601): [
+        (290, 200, 350, 260),
+        (365, 200, 430, 260),
+        (450, 200, 513, 260),
+        (290, 270, 350, 340),
+        (365, 270, 430, 340),
+        (445, 270, 513, 340),
+        (280, 350, 516, 390),  # ALT METİN
+    ],
+    (1024, 768): [
+        (400, 278, 465, 345), #
+        (480, 278, 545, 345),
+        (560, 278, 625, 345),
+        (400, 360, 465, 430), #
+        (475, 360, 545, 430),
+        (555, 360, 625, 430),
+        (398, 438, 631, 465),  # ALT METİN
+    ],
+    # İLERİDE ÖRNEK:
+    # (1024, 768): [
+    #     (... 7 kutu ...),
+    # ],
+}
+# Tolerans: her eksende ±30 piksel kabul edilebilir
+HARDCODED_OCR_TOLERANCE = 35
+
+CURRENT_VERSION = "2.0.5"
 
 GITHUB_REPO_OWNER = "merterbir"
 GITHUB_REPO_NAME = "AutoClicker-Updates"
@@ -58,7 +90,7 @@ MOD_TEMPLATES = {
         "upper_color": np.array([160, 90, 180]),
         "min_area": 400,
         "blocker_path": "meteorBlocker.png",
-        "is_visible": True
+        "is_visible": False
     },
     "ZUNG": {
         "title": "Zung Tarama",
@@ -66,7 +98,7 @@ MOD_TEMPLATES = {
         "upper_color": np.array([30, 255, 250]),
         "min_area": 700,
         "blocker_path": "zungblocker.png",
-        "is_visible": True
+        "is_visible": False
     },
     "KIZIL": {
         "title": "Kızıl Orman Güney Tarama",
@@ -74,7 +106,15 @@ MOD_TEMPLATES = {
         "upper_color": np.array([10, 200, 200]),
         "min_area": 1000,
         "blocker_path": "kizilblocker.png",
-        "is_visible": True
+        "is_visible": False
+    },
+    "GUATAMA": {
+        "title": "Guatama Öfke Tarama",
+        "lower_color": np.array([115, 50, 20]),
+        "upper_color": np.array([165, 255, 255]),
+        "min_area": 700,
+        "blocker_path": "guatamablocker.png",
+        "is_visible": False
     }
 }
 
@@ -93,6 +133,13 @@ ALARM_VOLUME = 0.16
 
 alarm_wave_data = None
 
+# ========== OCR GLOBALS ==========
+try:
+    OCR_READER = easyocr.Reader(['en', 'tr'], gpu=False)
+except Exception as e:
+    OCR_READER = None
+
+OCR_LOCK = threading.Lock()
 
 # ================== HELPERS ==================
 def get_appdata_base_dir():
@@ -179,6 +226,11 @@ def get_default_config():
             "blocker_threshold": 0.70,
             "blocker_retry_seconds": 3.0
         },
+        # 🔹 YENİ: OCR CONFIG
+        "OCR_CONFIG": {
+            # resolution_key -> { "coords": [ (x1,y1,x2,y2) * 7 ] }
+            "profiles": {}
+        },
         "SAVED_INSTANCES": []
     }
 
@@ -250,6 +302,7 @@ def save_config(new_config):
         "PERFORMANCE_SETTINGS": GLOBAL_CONFIG.get("PERFORMANCE_SETTINGS", {}),
         "CLICK_SETTINGS": GLOBAL_CONFIG.get("CLICK_SETTINGS", {}),
         "MOD_SETTINGS": GLOBAL_CONFIG.get("MOD_SETTINGS", {}),
+        "OCR_CONFIG": GLOBAL_CONFIG.get("OCR_CONFIG", {}),
     }
 
     try:
@@ -552,6 +605,116 @@ class ColorRegionSelector:
 
         self.callback(screen_x1, screen_y1, screen_x2, screen_y2)
 
+class OCRSelectionWindow:
+    """
+    Ayarlanacak OCR koordinatları için:
+    - Verilen PIL image üstünde 7 kutu seçtirir
+    - Seçim bitince done_callback(coords_list, original_size) çağırır
+      coords_list: [(x1,y1,x2,y2), ...] 7 eleman
+      original_size: (w, h)
+    """
+    def __init__(self, master, pil_image, done_callback):
+        self.master = master
+        self.done_callback = done_callback
+
+        # Gelen argüman **PIL Image** olmak zorunda
+        self.img = pil_image.convert("RGB")
+        self.img_w, self.img_h = self.img.size
+
+        # Yeni pencere (ayar penceresinin üstüne)
+        self.top = tk.Toplevel(master)
+        self.top.title("OCR Konfigürasyon - 7 Kutu Seç")
+        self.top.attributes("-topmost", True)
+
+        # Ekrana sığdır
+        screen_w = self.top.winfo_screenwidth() - 80
+        screen_h = self.top.winfo_screenheight() - 160
+        ratio = min(screen_w / self.img_w, screen_h / self.img_h, 1.0)
+        self.display_w = int(self.img_w * ratio)
+        self.display_h = int(self.img_h * ratio)
+        self.scale = self.img_w / self.display_w  # geri dönüşte çarpacağız
+
+        self.tk_img = ImageTk.PhotoImage(
+            self.img.resize((self.display_w, self.display_h), Image.Resampling.LANCZOS)
+        )
+
+        self.canvas = tk.Canvas(self.top, width=self.display_w, height=self.display_h, cursor="cross")
+        self.canvas.pack()
+
+        self.canvas.create_image(0, 0, anchor="nw", image=self.tk_img)
+
+        self.info_label = tk.Label(
+            self.top,
+            text="1. kutuyu seçin (toplam 7 kutu)",
+            font=("Segoe UI", 11, "bold")
+        )
+        self.info_label.pack(fill="x", pady=4)
+
+        self.boxes = []      # gerçek (orijinal) koordinatlar
+        self.temp_rect = None
+        self.start_x = 0
+        self.start_y = 0
+
+        self.canvas.bind("<ButtonPress-1>", self._box_press)
+        self.canvas.bind("<B1-Motion>", self._box_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._box_release)
+
+    def _box_press(self, event):
+        self.start_x, self.start_y = event.x, event.y
+        if self.temp_rect is not None:
+            self.canvas.delete(self.temp_rect)
+        self.temp_rect = self.canvas.create_rectangle(
+            self.start_x, self.start_y, event.x, event.y,
+            outline="red", width=2
+        )
+
+    def _box_drag(self, event):
+        if self.temp_rect is not None:
+            self.canvas.coords(self.temp_rect, self.start_x, self.start_y, event.x, event.y)
+
+    def _box_release(self, event):
+        x1, y1 = self.start_x, self.start_y
+        x2, y2 = event.x, event.y
+
+        # Canvas koordinatlarını normalize et
+        x1, x2 = sorted((x1, x2))
+        y1, y2 = sorted((y1, y2))
+
+        # Ekran görüntüsü orijinal boyutuna geri dön
+        real_x1 = int(x1 * self.scale)
+        real_y1 = int(y1 * self.scale)
+        real_x2 = int(x2 * self.scale)
+        real_y2 = int(y2 * self.scale)
+
+        self.boxes.append((real_x1, real_y1, real_x2, real_y2))
+
+        # Kalıcı yeşil kutu çiz
+        self.canvas.create_rectangle(x1, y1, x2, y2, outline="lime", width=2)
+        self.canvas.create_text(
+            x1 + 10, y1 + 10,
+            text=str(len(self.boxes)),
+            fill="yellow",
+            font=("Segoe UI", 10, "bold")
+        )
+
+        # Yeterli kutu seçildi mi?
+        if len(self.boxes) < 7:
+            self.info_label.config(text=f"{len(self.boxes)+1}. kutuyu seçin (toplam 7)")
+        else:
+            self.info_label.config(text="Tamamlandı, pencere kapanıyor...")
+
+            # Kutuları x1,y1'e göre sırala (sabit olması için)
+            boxes_sorted = sorted(self.boxes, key=lambda b: (b[1], b[0]))  # önce y sonra x
+
+            # Callback → coords_list, original_size
+            original_size = (self.img_w, self.img_h)
+            try:
+                self.done_callback(boxes_sorted, original_size)
+            except Exception as e:
+                messagebox.showerror("Hata", f"OCR callback hatası: {e}")
+
+            self.top.destroy()
+
 
 # ================== MAIN APP ==================
 class AutoClickerApp:
@@ -609,6 +772,246 @@ class AutoClickerApp:
         self._save_persistent_settings()
         self.master.destroy()
         sys.exit(0)
+        # ---------- OCR Helpers ----------
+    def _ocr_enhance_image(self, gray_np):
+        """
+        OCR için görüntüyü büyüt + OTSU threshold uygula.
+        gray_np: tek kanal (grayscale) numpy array
+        """
+        if gray_np is None or gray_np.size == 0:
+            return gray_np
+
+        scale = 3
+        resized = cv2.resize(
+            gray_np, None,
+            fx=scale, fy=scale,
+            interpolation=cv2.INTER_CUBIC
+        )
+        _, thresh = cv2.threshold(
+            resized, 0, 255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        return thresh
+
+    def _ocr_read_text(self, img_processed):
+        """
+        EasyOCR ile metni oku (global lock ile).
+        """
+        if OCR_READER is None:
+            return ""
+        with OCR_LOCK:
+            result = OCR_READER.readtext(
+                img_processed,
+                detail=0,
+                paragraph=False
+            )
+        return " ".join(result).strip()
+
+    def run_control_ocr_for_mod(self, mod_instance):
+        """
+        Control.png yakalandığında çağrılır.
+        - Modun region_rect'ine göre pencereyi çeker
+        - KODA GÖMÜLÜ 7 kare profilini kullanarak:
+        1) Alt metin alanından hedef string'i çıkarır
+        2) 6 kare içinde normalize ederek eşleşeni bulur
+        3) Eşleşen karenin ortasına gidip 1 sn sonra tıklar
+        - Eşleşme yoksa 3 sn sonra tekrar dener (1 kez).
+        """
+        if OCR_READER is None:
+            self.status_text.set("OCR modeli yüklü değil (easyocr).")
+            return
+
+        region = mod_instance.get("region_rect")
+        if not region:
+            self.status_text.set("OCR için bölge seçilmemiş.")
+            return
+
+        X1, Y1, X2, Y2 = region
+        w = X2 - X1
+        h = Y2 - Y1
+
+        # ----------------- HARDCODED OCR PROFİL SEÇİMİ -----------------
+        best_key = None
+        best_score = None
+
+        for (pw, ph), boxes in HARDCODED_OCR_PROFILES.items():
+            # Her eksende ayrı tolerans kontrolü
+            if abs(pw - w) > HARDCODED_OCR_TOLERANCE:
+                continue
+            if abs(ph - h) > HARDCODED_OCR_TOLERANCE:
+                continue
+
+            # Ne kadar yakın? Basit skor: |Δw| + |Δh|
+            score = abs(pw - w) + abs(ph - h)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_key = (pw, ph)
+
+        if best_key is None:
+            self.status_text.set(
+                f"OCR profili bulunamadı. Ekran: {w}x{h}, profiller: "
+                f"{[f'{pw}x{ph}' for (pw, ph) in HARDCODED_OCR_PROFILES.keys()]}"
+            )
+            return
+
+        base_w, base_h = best_key
+        base_boxes = HARDCODED_OCR_PROFILES[best_key]
+
+        sx = w / base_w
+        sy = h / base_h
+
+        coords_list = []
+        for (cx1, cy1, cx2, cy2) in base_boxes:
+            coords_list.append((
+                int(cx1 * sx),
+                int(cy1 * sy),
+                int(cx2 * sx),
+                int(cy2 * sy),
+            ))
+
+        if len(coords_list) != 7:
+            self.status_text.set(
+                f"HARDCODED OCR profili bozuk: {base_w}x{base_h} → {len(coords_list)} kutu"
+            )
+            return
+
+        # Debug istersen
+        # ----------------- HARDCODED OCR PROFİL SEÇİMİ SONU -----------------
+
+        def _one_try():
+            try:
+                sct = mss.mss()
+                monitor = {"top": Y1, "left": X1, "width": w, "height": h}
+                sct_img = sct.grab(monitor)
+                img_np = np.array(sct_img)
+                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR)
+                gray_full = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+                #self.save_ocr_debug_screenshot(img_bgr.copy(), coords_list)
+            except Exception as e:
+                self.status_text.set(f"OCR ekran görüntüsü hatası: {e}")
+                return False, None
+
+            # 7. alan: alt metin
+            tx1, ty1, tx2, ty2 = coords_list[6]
+            text_crop = gray_full[ty1:ty2, tx1:tx2].copy()
+            enhanced_text = self._ocr_enhance_image(text_crop)
+            raw_text = self._ocr_read_text(enhanced_text)
+            cleaned_text = raw_text.replace("\n", " ").strip()
+
+            # "arasindan X resmini" pattern'i
+            target_norm = ""
+            candidate_raw = ""
+            m = re.search(
+                r"arasindan\s+(.*?)\s+(resmini|image)",
+                cleaned_text,
+                re.IGNORECASE
+            )
+            if m:
+                candidate_raw = m.group(1).strip()
+                target_norm = self._ocr_normalize_token(candidate_raw)
+
+            if not target_norm:
+                self.status_text.set(f"OCR hedef bulunamadı. Ham: '{cleaned_text}'")
+                return False, None
+
+            self.status_text.set(f"OCR hedef: '{target_norm}' (Ham: '{candidate_raw}')")
+
+            # 6 kareyi tara
+            for i in range(6):
+                bx1, by1, bx2, by2 = coords_list[i]
+                box_crop = gray_full[by1:by2, bx1:bx2].copy()
+                enhanced_box = self._ocr_enhance_image(box_crop)
+                box_raw = self._ocr_read_text(enhanced_box)
+                box_norm = self._ocr_normalize_token(box_raw)
+
+                if target_norm and target_norm in box_norm:
+                    # Eğer daha önce tıklandıysa → tekrar tıklama yok
+                    if mod_instance.get("has_clicked", False):
+                        return True, None
+
+                    # tıklama yapıyoruz
+                    bx_mid = int((bx1 + bx2) / 2)
+                    by_mid = int((by1 + by2) / 2)
+                    click_x = X1 + bx_mid
+                    click_y = Y1 + by_mid
+
+                    self.status_text.set(f"OCR eşleşmesi: {i+1}. kare (tıklanıyor...)")
+
+                    # işaretle
+                    mod_instance["has_clicked"] = True
+                    # 10 saniye sonra resetle
+                    self.master.after(
+                        10000,
+                        lambda m=mod_instance: m.update(has_clicked=False)
+                    )
+
+                    # tıklama
+                    try:
+                        pyautogui.moveTo(click_x, click_y, duration=0.2)
+                        time.sleep(0.8)
+                        pyautogui.click(click_x, click_y)
+                    except:
+                        pass
+
+                    return True, (click_x, click_y)
+
+            # Hiç eşleşme yok
+            self.status_text.set("OCR ile eşleşen kare bulunamadı.")
+            return False, None
+
+
+        # İlk deneme
+        ok, pos = _one_try()
+        if ok:
+            return
+
+
+
+        # Eşleşme yoksa 3 sn sonra 1 kez daha dene
+        time.sleep(3.0)
+        _one_try()
+
+    def save_ocr_debug_screenshot(self, img_bgr, coords_list):
+        try:
+            # 1-6 kare = yeşil dikdörtgen
+            for i in range(6):
+                x1, y1, x2, y2 = coords_list[i]
+                cv2.rectangle(img_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(img_bgr, str(i + 1), (x1 + 5, y1 + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+            # 7. kare = sarı (alt metin)
+            x1, y1, x2, y2 = coords_list[6]
+            cv2.rectangle(img_bgr, (x1, y1), (x2, y2), (0, 255, 255), 2)
+            cv2.putText(img_bgr, "TXT", (x1 + 5, y1 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            # Dosyaya kaydet
+            filename = f"ocr_debug_{int(time.time())}.png"
+            cv2.imwrite(filename, img_bgr)
+
+        except Exception as e:
+            print("OCR debug ekran kaydetme hatası:", e)
+
+    
+
+    def _ocr_normalize_token(self, text):
+        """
+        Harf/rakam karışımı için normalizasyon:
+        - alfasayısal dışı her şeyi at
+        - küçült
+        - 0->o, 1->l, 5->s
+        """
+        if not text:
+            return ""
+        alnum = re.sub(r"[^0-9A-Za-z]", "", text)
+        lower = alnum.lower()
+        return (
+            lower
+            .replace("0", "o")
+            .replace("1", "l")
+            .replace("5", "s")
+        )
 
     # ---------- Toggle per-mod ----------
     def toggle_bot(self, mod_instance):
@@ -1213,6 +1616,32 @@ class AutoClickerApp:
         else:
             self.status_text.set("Hata: Aktif pencere bulunamadı. Lütfen tekrar deneyin.")
 
+    def trigger_ocr_selection_for_region(self, mod_instance):
+        r = mod_instance.get("region_rect")
+        if not r:
+            messagebox.showerror("Hata", "Önce pencere bölgesini seçin.")
+            return
+
+        X1, Y1, X2, Y2 = r
+        w = X2 - X1
+        h = Y2 - Y1
+
+        res_key = f"{w}x{h}"
+
+        sct = mss.mss()
+        monitor = {"top": Y1, "left": X1, "width": w, "height": h}
+        sct_img = sct.grab(monitor)
+        img_np = np.array(sct_img)
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR)
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(img_rgb)
+
+        OCRSelectionWindow(
+            self.master,
+            pil_image,
+            lambda coords, size: self._save_ocr_coords_for_res(res_key, coords, size)
+        )
+
     def trigger_color_region_selection(self, mod_instance):
         if mod_instance.get("region_rect") is None:
             messagebox.showerror("Hata", "Önce pencere bölgesini (Bölge Seç) belirleyin.")
@@ -1251,42 +1680,93 @@ class AutoClickerApp:
         self._save_persistent_settings()
 
     # ---------- Alert / Stop ----------
-    def _check_alert_and_action(self, gray):
-        now = time.time()
-        if now < self.next_alert_allowed_time:
-            return False
+        # ---------- Alert / Stop ----------
+    def _check_alert_and_action(self, gray_full, mod_instance):
+        """
+        Alert görsellerini tarar.
+        - control: OCR tetikler, botları DURDURMAZ, False döner
+        - tic / message / control (isteğe bağlı) için:
+            stop_on_alert_main + ilgili checkbox açıksa -> tüm botlar durur, True döner
+        - 'dead' görülürse her durumda tüm botlar durur, True döner
+        """
+        try:
+            for alert_id, alert_data in self.alert_templates.items():
+                # Eski: alert_data direkt template'di
+                # Yeni: dict olabilir {"img": template, "threshold": 0.85}
+                if isinstance(alert_data, dict):
+                    template = alert_data.get("img")
+                    threshold = float(alert_data.get("threshold", ALERT_THRESHOLD))
+                else:
+                    template = alert_data
+                    threshold = ALERT_THRESHOLD
 
-        alert_checks = {
-            "tic": self.stop_on_tic.get(),
-            "message": self.stop_on_message.get(),
-            "control": self.stop_on_control.get()
-        }
+                if template is None:
+                    continue
 
-        found_alert_for_stop = False
+                res = cv2.matchTemplate(gray_full, template, cv2.TM_CCOEFF_NORMED)
+                loc = np.where(res >= threshold)
 
-        for key, template in self.alert_templates.items():
-            res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
-            _, mv, _, _ = cv2.minMaxLoc(res)
+                if len(loc[0]) == 0:
+                    continue  # bu alert yok, diğerine bak
 
-            if mv >= ALERT_THRESHOLD:
-                self.master.after(
-                    0,
-                    lambda k=key: self.status_text.set(
-                        f"!!! KRİTİK ALERT !!! {k.upper()}.png bulundu!"
-                    )
-                )
-                play_alert_sound()
-                self.next_alert_allowed_time = now + ALERT_COOLDOWN
+                # Buraya geldiysek, alert bulundu
+                self.status_text.set(f"ALERT YAKALANDI → {alert_id}")
 
-                if self.stop_on_alert_main.get() and alert_checks.get(key, False):
-                    self.master.after(0, self.stop_all_bots)
-                    found_alert_for_stop = True
-                    break
+                # ---- CONTROL: OCR çalıştır, botları durdurma ----
+                if alert_id == "control":
+                    self.status_text.set("CONTROL bulundu → OCR tıklama başlıyor!")
+                    Thread(
+                        target=self.run_control_ocr_for_mod,
+                        args=(mod_instance,),
+                        daemon=True
+                    ).start()
+                    # control için loop’u kırma, sadece OCR thread’i çalışsın
+                    return False
 
-                self.paused_until = now + PAUSE_ON_ALERT_SECONDS
-                break
+                # ---- Diğer alertlerin sesleri ----
+                if alert_id == "message":
+                    self.status_text.set("MESSAGE tetiklendi (alarm)")
+                    winsound.Beep(700, 500)
 
-        return found_alert_for_stop
+                if alert_id == "tic":
+                    self.status_text.set("TIC tetiklendi (alarm)")
+                    winsound.Beep(1000, 300)
+
+                # ---- Hangi durumda botları durduracağız? ----
+                should_stop = False
+
+                # Genel "Alert Bulunduğunda Bot Durdurulsun" açık mı?
+                if self.stop_on_alert_main.get():
+                    if alert_id == "tic" and self.stop_on_tic.get():
+                        should_stop = True
+                    elif alert_id == "message" and self.stop_on_message.get():
+                        should_stop = True
+                    elif alert_id == "control" and self.stop_on_control.get():
+                        # Şu an CONTROL için durdurma istemiyorsan bunu kaldırabilirsin
+                        should_stop = True
+
+                # Özel "dead" alert'i → her durumda durdur
+                if alert_id == "dead":
+                    should_stop = True
+
+                if should_stop:
+                    # Tüm modları durdur
+                    self.stop_all_bots()
+                    return True
+
+                # Eğer stop etmeyeceksek ama alert tetiklendiyse,
+                # o anki mod loop’u için True/False ne istediğine göre karar verebilirsin.
+                # Şu an durdurmuyorsak False döndürüyoruz.
+                return False
+
+        except Exception as e:
+            print("Alert check hatası:", e)
+
+        # Hiçbir alert tetiklenmediyse
+        return False
+
+
+
 
     def stop_all_bots(self):
         app_config = GLOBAL_CONFIG['APP_CONFIG']
@@ -1354,9 +1834,25 @@ class AutoClickerApp:
             "height": Y2 - Y1
         }
 
-        LOWER_COLOR = np.array(mod_instance["lower_color"])
-        UPPER_COLOR = np.array(mod_instance["upper_color"])
-        MIN_AREA = mod_instance["min_area"]
+        mod_key = mod_instance.get("mod_key")
+        template = MOD_TEMPLATES.get(mod_key, {})
+
+        lower = mod_instance.get(
+            "lower_color",
+            template.get("lower_color", np.array([0, 0, 0]))
+        )
+        upper = mod_instance.get(
+            "upper_color",
+            template.get("upper_color", np.array([179, 255, 255]))
+        )
+        min_area = mod_instance.get(
+            "min_area",
+            template.get("min_area", 200)
+        )
+
+        LOWER_COLOR = np.array(lower, dtype=np.uint8)
+        UPPER_COLOR = np.array(upper, dtype=np.uint8)
+        MIN_AREA = int(min_area)
 
         action_due = True
         next_blocker_check_time = 0.0
@@ -1374,8 +1870,16 @@ class AutoClickerApp:
                 hsv_full = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
                 gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+                # =======================================================
+                # YENİ — OCR Uyumlu Alert kontrolü
+                # =======================================================
+                # önceki hali:
+                # if time.time() >= self.next_alert_check_time:
+                #     if self._check_alert_and_action(gray_full):
+                #         break
+                # =======================================================
                 if time.time() >= self.next_alert_check_time:
-                    if self._check_alert_and_action(gray_full):
+                    if self._check_alert_and_action(gray_full, mod_instance):
                         break
                     self.next_alert_check_time = time.time() + ALERT_CHECK_INTERVAL
 
@@ -1503,6 +2007,7 @@ class AutoClickerApp:
             )
 
         self.master.after(0, self._update_global_status)
+
 
     # ---------- Update Check ----------
     def start_update_check_thread(self):
@@ -1667,7 +2172,7 @@ class SettingsWindow:
 
         self.master = master
         self.current_config = GLOBAL_CONFIG.copy()
-
+        self.current_config.setdefault("OCR_CONFIG", {"profiles": {}})
         self.local_volume_value = tk.DoubleVar(value=ALARM_VOLUME)
 
         tk.Button(
@@ -1685,6 +2190,7 @@ class SettingsWindow:
 
         self._create_general_settings_tab()
         self._create_image_settings_tab()
+        self._create_ocr_settings_tab()
 
     def _create_general_settings_tab(self):
         tab = ttk.Frame(self.notebook)
@@ -1847,6 +2353,134 @@ class SettingsWindow:
         for mod_key, conf in MOD_TEMPLATES.items():
             self._create_blocker_setting_button(blocker_frame, mod_key, conf["title"])
 
+        # ---------- OCR CONFIG TAB ----------
+    def _create_ocr_settings_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="OCR Config")
+
+        info = tk.Label(
+            tab,
+            text=(
+                "Bu sekme, Control görseli geldiğinde kullanılacak OCR alanlarını ayarlamak içindir.\n"
+                "1) 'Başlat (7 Kare Seç)'e bas.\n"
+                "2) 2 sn içinde oyunun penceresini aktif yap.\n"
+                "3) Açılan ekranda sırayla 6 kare + 1 alt metin alanını seç.\n"
+                "4) Ayarlar, pencere çözünürlüğüne göre kaydedilir."
+            ),
+            justify="left",
+            wraplength=420
+        )
+        info.pack(padx=10, pady=10, anchor="w")
+
+        btn = tk.Button(
+            tab,
+            text="▶ Başlat (7 Kare Seç)",
+            command=self._start_ocr_capture
+        )
+        btn.pack(padx=10, pady=10, anchor="w")
+
+        self.ocr_profiles_list = tk.Listbox(tab, height=5)
+        self.ocr_profiles_list.pack(padx=10, pady=(10, 0), fill="x")
+
+        # Var olan profilleri listele
+        profiles = self.current_config.get("OCR_CONFIG", {}).get("profiles", {})
+        for key in profiles.keys():
+            self.ocr_profiles_list.insert(tk.END, key)
+
+    def _start_ocr_capture(self):
+        # 2 saniye içinde doğru pencereyi aktif etsin
+        messagebox.showinfo(
+            "Bilgi",
+            "2 saniye içinde OCR ayarı yapılacak pencereyi aktif yap.\n"
+            "Sonra o pencerenin ekran görüntüsü üzerinden 7 kare seçeceksin."
+        )
+
+        # 2 sn sonra gerçek capture fonksiyonunu çalıştır
+        # 🔴 ÖNEMLİ: SettingsWindow içinde root değil, settings_root var
+        self.settings_root.after(2000, self._capture_ocr_screenshot)
+
+
+
+    def _capture_ocr_screenshot(self):
+        try:
+            # Aktif pencere boyutlarını al
+            hwnd = win32gui.GetForegroundWindow()
+            if not hwnd:
+                messagebox.showerror("Hata", "Aktif pencere bulunamadı.")
+                return
+
+            rect = win32gui.GetWindowRect(hwnd)
+            X1, Y1, X2, Y2 = rect
+            w = X2 - X1
+            h = Y2 - Y1
+
+            if w <= 0 or h <= 0:
+                messagebox.showerror("Hata", "Aktif pencere boyutu geçersiz.")
+                return
+
+            # Bu rect'i OCR_CONFIG için çözünürlük key'i olarak saklayacağız
+            self.ocr_active_window_rect = (X1, Y1, X2, Y2)
+            res_key = f"{w}x{h}"
+
+            # Ekran görüntüsü (sadece bu pencere)
+            with mss.mss() as sct:
+                monitor = {"top": Y1, "left": X1, "width": w, "height": h}
+                sct_img = sct.grab(monitor)
+                img_np = np.array(sct_img)
+                img_rgb = cv2.cvtColor(img_np, cv2.COLOR_BGRA2RGB)
+
+            pil_img = Image.fromarray(img_rgb)
+
+            # 7 kutu seçtir → sonuçlar _on_ocr_coords_selected'e gelecek
+            OCRSelectionWindow(
+                self.settings_root,
+                pil_img,
+                self._on_ocr_coords_selected
+            )
+
+        except Exception as e:
+            messagebox.showerror("Hata", f"OCR ekran görüntüsü alınamadı: {e}")
+
+
+    def _on_ocr_coords_selected(self, coords_list, original_size):
+        """
+        OCRSelectionWindow'dan gelen 7 kutuyu:
+        - Çözünürlüğe göre OCR_CONFIG'e yazar
+        - Koordinatlar **region_rect içinde relatif** olacak (X1,Y1 çıkarılmış)
+        """
+        if not hasattr(self, "ocr_active_window_rect"):
+            messagebox.showerror("Hata", "Aktif pencere bilgisi yok.")
+            return
+
+        X1, Y1, X2, Y2 = self.ocr_active_window_rect
+        win_w = X2 - X1
+        win_h = Y2 - Y1
+        res_key = f"{win_w}x{win_h}"
+
+        # coords_list: pencere içi koordinatlar (zaten orijinal boyut)
+        rel_coords = []
+        for (x1, y1, x2, y2) in coords_list:
+            rel_coords.append((
+                max(0, x1),
+                max(0, y1),
+                min(win_w, x2),
+                min(win_h, y2)
+            ))
+
+        # Config'e yaz
+        ocr_conf = GLOBAL_CONFIG.setdefault("OCR_CONFIG", {})
+        profiles = ocr_conf.setdefault("profiles", {})
+        profiles[res_key] = {
+            "coords": rel_coords
+        }
+
+        save_config(GLOBAL_CONFIG)
+        messagebox.showinfo(
+            "Başarılı",
+            f"OCR config kaydedildi. Çözünürlük: {res_key}\nToplam 7 kutu: {len(rel_coords)}"
+        )
+
+
     def _create_blocker_setting_button(self, parent_frame, mod_key, title_text):
         filename = f"{mod_key.lower()}Blocker.jpg"
         btn_func = lambda f=filename: self.start_blocker_area_selection(f)
@@ -2002,13 +2636,15 @@ class DebugWindow:
         self.master = master
         self.root = Toplevel(master)
         self.root.title("Debug - HSV Canlı Görüntü")
-        self.root.geometry("360x330")
+        self.root.geometry("900x900")
+
         self.root.resizable(False, False)
 
         self.debug_region_rect = None
         self.debug_running = False
         self.debug_thread = None
 
+        # HSV ve area değerleri
         self.lower_h_var = tk.StringVar(value="0")
         self.lower_s_var = tk.StringVar(value="150")
         self.lower_v_var = tk.StringVar(value="150")
@@ -2019,8 +2655,15 @@ class DebugWindow:
 
         self.min_area_var = tk.StringVar(value="80")
 
+        # Önizleme için
+        self.last_frame = None
+        self.preview_photo = None
+
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # Önizleme güncelleme loop'u
+        self._schedule_preview_update()
 
     def _build_ui(self):
         tk.Label(
@@ -2077,6 +2720,14 @@ class DebugWindow:
         tk.Entry(area_frame, width=6, textvariable=self.min_area_var).pack(
             side=tk.LEFT, padx=3
         )
+
+        # Canlı önizleme label'ı
+        self.preview_frame = tk.Frame(self.root)
+        self.preview_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.preview_label = tk.Label(self.preview_frame, text="Önizleme yok")
+        self.preview_label.pack(fill=tk.BOTH, expand=True)
+
 
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(pady=10)
@@ -2145,10 +2796,6 @@ class DebugWindow:
 
     def stop_debug(self):
         self.debug_running = False
-        try:
-            cv2.destroyWindow("Debug Preview")
-        except Exception:
-            pass
 
     def debug_loop(self):
         sct = mss.mss()
@@ -2190,22 +2837,42 @@ class DebugWindow:
                             vis, (x, y), (x + w, y + h), (0, 0, 255), 2
                         )
 
-                cv2.imshow("Debug Preview", vis)
-                cv2.waitKey(1)
+                # Sadece son frame'i tut, gösterme işini Tk tarafı yapacak
+                self.last_frame = vis
 
             except Exception:
                 pass
 
             time.sleep(0.05)
 
-        try:
-            cv2.destroyWindow("Debug Preview")
-        except Exception:
-            pass
+    def _schedule_preview_update(self):
+        """Tk tarafında, son frame'i alıp label'da gösterir."""
+        if not self.root.winfo_exists():
+            return
+
+        if self.last_frame is not None:
+            try:
+                frame_rgb = cv2.cvtColor(self.last_frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(frame_rgb)
+
+                # Küçük bir boyuta ölçekle (örn. 320x180)
+                img = img.resize((self.preview_label.winfo_width(),
+                  self.preview_label.winfo_height()),
+                  Image.Resampling.LANCZOS)
+
+
+                self.preview_photo = ImageTk.PhotoImage(img)
+                self.preview_label.configure(image=self.preview_photo, text="")
+            except Exception:
+                pass
+
+        # 50ms sonra tekrar
+        self.root.after(50, self._schedule_preview_update)
 
     def on_close(self):
         self.stop_debug()
         self.root.destroy()
+
 
 
 # ================== MAIN ==================
